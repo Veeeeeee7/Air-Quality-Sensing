@@ -7,6 +7,8 @@ import torch.nn.functional as F
 import argparse
 import os
 import datetime
+import sys
+import tracemalloc
 
 def get_parser():
     description = "MiniRocket with RandomForest Classifier and Cross Validation"
@@ -137,7 +139,7 @@ class LayerNormalization(nn.Module):
 
   
 class PositionwiseFeedForward(nn.Module):
-    def __init__(self, d_model, hidden, drop_prob=0.1):
+    def __init__(self, d_model, hidden, drop_prob):
         super(PositionwiseFeedForward, self).__init__()
         self.linear1 = nn.Linear(d_model, hidden)
         self.linear2 = nn.Linear(hidden, d_model)
@@ -224,63 +226,6 @@ class MultiHeadCrossAttention(nn.Module):
         return out
 
 
-class DecoderLayer(nn.Module):
-    def __init__(self, d_model, ffn_hidden, num_heads, drop_prob):
-        super(DecoderLayer, self).__init__()
-        self.self_attention = MultiHeadAttention(d_model=d_model, num_heads=num_heads)
-        self.layer_norm1 = LayerNormalization(parameters_shape=[d_model])
-        self.dropout1 = nn.Dropout(p=drop_prob)
-
-        self.encoder_decoder_attention = MultiHeadCrossAttention(d_model=d_model, num_heads=num_heads)
-        self.layer_norm2 = LayerNormalization(parameters_shape=[d_model])
-        self.dropout2 = nn.Dropout(p=drop_prob)
-
-        self.ffn = PositionwiseFeedForward(d_model=d_model, hidden=ffn_hidden, drop_prob=drop_prob)
-        self.layer_norm3 = LayerNormalization(parameters_shape=[d_model])
-        self.dropout3 = nn.Dropout(p=drop_prob)
-
-    def forward(self, x, y, self_attention_mask, cross_attention_mask):
-        _y = y.clone()
-        y = self.self_attention(y, mask=self_attention_mask)
-        y = self.dropout1(y)
-        y = self.layer_norm1(y + _y)
-
-        _y = y.clone()
-        y = self.encoder_decoder_attention(x, y, mask=cross_attention_mask)
-        y = self.dropout2(y)
-        y = self.layer_norm2(y + _y)
-
-        _y = y.clone()
-        y = self.ffn(y)
-        y = self.dropout3(y)
-        y = self.layer_norm3(y + _y)
-        return y
-
-
-class SequentialDecoder(nn.Sequential):
-    def forward(self, *inputs):
-        x, y, self_attention_mask, cross_attention_mask = inputs
-        for module in self._modules.values():
-            y = module(x, y, self_attention_mask, cross_attention_mask)
-        return y
-
-class Decoder(nn.Module):
-    def __init__(self, 
-                 d_model, 
-                 ffn_hidden, 
-                 num_heads, 
-                 drop_prob, 
-                 num_layers):
-        super().__init__()
-        self.spatiotemporal_embedding = SpatiotemporalEnconder(d_model)
-        self.layers = SequentialDecoder(*[DecoderLayer(d_model, ffn_hidden, num_heads, drop_prob) for _ in range(num_layers)])
-
-    def forward(self, x, y, self_attention_mask, cross_attention_mask):
-        y = self.spatiotemporal_embedding(x)
-        y = self.layers(x, y, self_attention_mask, cross_attention_mask)
-        return y
-
-
 class Transformer(nn.Module):
     def __init__(self, 
                 d_model, 
@@ -290,22 +235,14 @@ class Transformer(nn.Module):
                 num_layers):
         super().__init__()
         self.encoder = Encoder(d_model, ffn_hidden, num_heads, drop_prob, num_layers)
-        # self.decoder = Decoder(d_model, ffn_hidden, num_heads, drop_prob, num_layers)
         self.linear = nn.Linear(d_model, 1)
         self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
     def forward(self, 
                 x, 
                 y, 
-                encoder_self_attention_mask=None, 
-                decoder_self_attention_mask=None, 
-                decoder_cross_attention_mask=None,
-                enc_start_token=False,
-                enc_end_token=False,
-                dec_start_token=False, # We should make this true
-                dec_end_token=False): # x, y are batch of sentences
+                encoder_self_attention_mask=None): # x, y are batch of sentences
         x = self.encoder(x, encoder_self_attention_mask)
-        # out = self.decoder(x, y, decoder_self_attention_mask, decoder_cross_attention_mask)
         out = self.linear(x)
         return out
 
@@ -319,6 +256,8 @@ def log(message):
     print(message)
 
 if __name__ == "__main__":
+    tracemalloc.start()
+
     parser = get_parser()
     args = parser.parse_args()
     device = get_device()
@@ -344,46 +283,56 @@ if __name__ == "__main__":
     X_val = pd.concat([val_numerical_features, val_position_features, val_time_features], axis=1)
     y_val = val_values.drop(columns=['station_id'])
 
-    # Sample 100 from train and 10 from val
-    X_train = X_train.sample(n=100, random_state=42)
-    y_train = y_train.iloc[X_train.index]
-
-    X_val = X_val.sample(n=10, random_state=42)
-    y_val = y_val.iloc[X_val.index]
+    # Sample 1000 from train and 100 from val
+    X_train = X_train.sample(n=10000, random_state=42)
+    y_train = y_train.loc[X_train.index]
+    X_val = X_val.sample(n=10000, random_state=42)
+    y_val = y_val.loc[X_val.index]
 
     # Define the model
-    model = Transformer(d_model=512, ffn_hidden=8096, num_heads=32, drop_prob=0.1, num_layers=24)
+    model = Transformer(d_model=128, ffn_hidden=512, num_heads=8, drop_prob=0.001, num_layers=96)
 
     # Define the loss function
     criterion = nn.MSELoss()
 
     # Define the optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
 
+    X_train = X_train.fillna(0)
     y_train = torch.tensor(y_train.values, dtype=torch.float32)
     y_train = y_train.clone().detach().requires_grad_(False)
     y_train[torch.isnan(y_train)] = 0
 
-    X_train = X_train.fillna(0)
-    X_val = X_val.fillna(0)
-    
     log('Training model')
     # Train the model
-    for epoch in range(10):
+    for epoch in range(5):
         optimizer.zero_grad()
         y_pred = model(X_train, y_train)
         y_pred = y_pred.view(-1, 1)
         loss = criterion(y_pred, y_train)
         loss.backward()
         optimizer.step()
-        log(f'Epoch {epoch} Loss {loss.item()}')
+        log(f'Epoch {epoch+1} Loss {loss.item()}')
 
     # Test the model
+    X_val = X_val.fillna(0)
+    y_val = y_val.fillna(0)
     y_pred = model(X_val, y_val)
+    y_pred = y_pred.view(-1, 1)
     loss = criterion(y_pred, torch.tensor(y_val.values, dtype=torch.float32))
-    mse_loss = loss.item()
     mean_val = torch.mean(torch.tensor(y_val.values, dtype=torch.float32)).item()
-    percent_error = mse_loss / mean_val
+    percent_error = torch.sqrt(loss).item() / mean_val
     log(f'Validation Loss {loss.item()}')
     log(f'Validation % Error {percent_error}')
+    log(f'Validation RMSE {torch.sqrt(loss).item()}')
+
+
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    params = sum([np.prod(p.size()) for p in model_parameters])
+    memory = params * 4 / (1024 ** 2)  # Assuming 4 bytes per parameter (float32)
+    log(f'Model memory usage: {memory:.2f} MB')
+
+    current, peak = tracemalloc.get_traced_memory()
+    log(f'Current memory usage is {current / 10**6}MB; Peak was {peak / 10**6}MB')
+    tracemalloc.stop()
 
